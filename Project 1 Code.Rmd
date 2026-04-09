@@ -1,0 +1,220 @@
+---
+title: "Project 1"
+output: html_notebook
+---
+
+## Initial Setup
+
+```{r}
+#Install and activate packages
+pkgs <- c(
+  "quantmod", "tidyverse", "lubridate",
+  "tseries", "forecast",
+  "dynlm", "lmtest", "sandwich", "zoo"
+)
+
+installed <- rownames(installed.packages())
+
+for (p in pkgs) {
+  if (!p %in% installed) {
+    install.packages(p, dependencies = TRUE)
+  }
+  library(p, character.only = TRUE)
+}
+```
+
+## Getting Our Data From FRED
+
+```{r}
+#We will are focusing on 2000 to present
+start_date <- as.Date("2000-01-01")
+end_date   <- Sys.Date()
+
+#Data we only care about
+symbols <- c("FEDFUNDS", "UNRATE", "CPIAUCSL")
+
+#Get data from FRED via package
+getSymbols(Symbols = symbols, src = "FRED", from = start_date, to = end_date)
+
+# Merge all series safely by date + omit NAs
+data_xts <- na.omit(merge(FEDFUNDS, UNRATE, CPIAUCSL))
+
+# Combine into one monthly data frame
+df <- tibble(
+  date     = as.Date(index(data_xts)),
+  fedfunds = as.numeric(data_xts$FEDFUNDS),
+  unrate   = as.numeric(data_xts$UNRATE),
+  cpi      = as.numeric(data_xts$CPIAUCSL)
+)
+
+head(df)
+```
+
+## Creating a Time Series of our Data
+
+```{r}
+#Create plot of all 3 in a row to compare
+df_long <- df %>%
+  pivot_longer(-date, names_to = "series", values_to = "value")
+
+ggplot(df_long, aes(x = date, y = value)) +
+  geom_line() +
+  facet_wrap(~series, scales = "free_y", ncol = 1) +
+  labs(title = "Time Series Plots (FRED)", x = NULL, y = NULL)
+```
+
+## Checking for Seasonality
+
+```{r}
+#Check for seasonality
+ggseasonplot(ts(df$unrate, frequency = 12,
+                start = c(year(min(df$date)), month(min(df$date)))),
+             year.labels = TRUE) +
+  ggtitle("Seasonal Plot: Unemployment Rate")
+```
+
+## Create Separate Dataframe for our Model
+
+```{r}
+#Create a new DF to create our DL model. Differencing the values for UNRATE and FEDFUNDS
+df2 <- df %>%
+  arrange(date) %>%
+  mutate(
+    d_unrate   = unrate - lag(unrate),
+    d_fedfunds = fedfunds - lag(fedfunds),
+    infl       = 100 * (log(cpi) - log(lag(cpi)))
+  ) %>%
+  drop_na()
+
+summary(df2)
+```
+
+## ADF Tests
+
+```{r}
+adf.test(df$unrate)        
+adf.test(df2$d_unrate)     #differenced
+
+adf.test(df$fedfunds)      
+adf.test(df2$d_fedfunds)   #differenced
+
+adf.test(df2$infl)
+```
+
+## ACF/PACF plots
+
+```{r}
+#Create ACF/PACF plots of variables
+par(mfrow = c(2,2))
+acf(df$unrate, main = "ACF: UNRATE (level)")
+pacf(df$unrate, main = "PACF: UNRATE (level)")
+acf(df2$d_unrate, main = "ACF: d_UNRATE")
+pacf(df2$d_unrate, main = "PACF: d_UNRATE")
+par(mfrow = c(1,1))
+```
+
+## Creating a Lagged Dataframe
+
+```{r}
+#Creating a Lagged Dataframe. Using 12 lags for econmoic purposes
+make_lags <- function(x, K, prefix = "x") {
+  out <- map_dfc(0:K, ~dplyr::lag(x, .x))
+  names(out) <- paste0(prefix, "_L", 0:K)
+  out
+}
+
+K <- 12
+
+Xlags <- make_lags(df2$d_fedfunds, K = K, prefix = "dff")
+df_m <- bind_cols(df2, Xlags) %>%
+  drop_na()
+```
+
+## Building our Finite Distributed Lag (FDL) Model
+
+```{r}
+# Build formula: d_unrate ~ dff_L0 + ... + dff_LK + infl
+lag_terms <- paste0("dff_L", 0:K, collapse = " + ")
+fml <- as.formula(paste("d_unrate ~", lag_terms, "+ infl"))
+
+dl_fit <- lm(fml, data = df_m)
+summary(dl_fit)
+```
+
+## AIC/BIC Test for Lag Selection
+
+```{r}
+#Lag selection using AIC/BIC
+fit_by_K <- function(K) {
+  Xlags <- make_lags(df2$d_fedfunds, K = K, prefix = "dff")
+  dm <- bind_cols(df2, Xlags) %>% drop_na()
+  lag_terms <- paste0("dff_L", 0:K, collapse = " + ")
+  fml <- as.formula(paste("d_unrate ~", lag_terms, "+ infl"))
+  fit <- lm(fml, data = dm)
+  tibble(K = K, AIC = AIC(fit), BIC = BIC(fit))
+}
+
+ic_tbl <- map_dfr(0:18, fit_by_K)
+ic_tbl %>% arrange(BIC) %>% print(n = 10)
+
+ggplot(ic_tbl, aes(x = K)) +
+  geom_line(aes(y = AIC)) +
+  geom_line(aes(y = BIC)) +
+  labs(title = "Lag Length Selection via AIC/BIC",
+       y = "Information Criterion", x = "Max Lag K")
+```
+
+## Newey-West Estimator
+
+```{r}
+#Newey-West for creating robust standard errors
+coeftest(dl_fit, vcov. = NeweyWest(dl_fit, lag = 6, prewhite = FALSE))
+```
+
+## Plot distributed lag effects
+
+```{r}
+#Plot distributed lag effects
+b <- coef(dl_fit)
+lag_b <- tibble(
+  lag = 0:K,
+  beta = b[paste0("dff_L", 0:K)]
+)
+
+ggplot(lag_b, aes(x = lag, y = beta)) +
+  geom_line() +
+  geom_point() +
+  labs(title = "Distributed Lag Effects: ΔFedFunds on ΔUnemployment",
+       x = "Lag (months)", y = "Coefficient")
+```
+
+## Plot ACF/PACF Residuals
+
+```{r}
+#Plot ACF/PACF Residuals
+par(mfrow = c(1,2))
+acf(residuals(dl_fit), main = "ACF: DL Residuals")
+pacf(residuals(dl_fit), main = "PACF: DL Residuals")
+par(mfrow = c(1,1))
+```
+
+## Durbin-Watson Test
+
+```{r}
+#Durbin-Watson Test
+dwtest(dl_fit) 
+```
+
+## Breusch-Godfrey
+
+```{r}
+#Breusch-Godfrey for higher-order serial correlation
+bgtest(dl_fit, order = 12)
+```
+
+## Breusch-Pagan Test
+
+```{r}
+#Breusch-Pagan Test
+bptest(dl_fit)  
+```
